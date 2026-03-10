@@ -1,0 +1,11 @@
+node_modules
+.next
+tmp
+*.zip
+repaired-clean-test
+repaired-final
+repaired-test
+.vercel
+.env
+.env.*
+!.env.example
