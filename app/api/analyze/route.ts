@@ -494,7 +494,7 @@ function detectIssues(projectRoot: string, summary: BuildSummaryResult): Analyze
       filePath: null,
       evidence: null,
       codeSnippet: null,
-    }););
+    });
   }
 
   const readmePath = path.join(projectRoot, "README.md");
@@ -511,7 +511,7 @@ function detectIssues(projectRoot: string, summary: BuildSummaryResult): Analyze
       filePath: null,
       evidence: null,
       codeSnippet: null,
-    }););
+    });
   }
 
   const usesDiscordWebhook =
@@ -535,7 +535,7 @@ function detectIssues(projectRoot: string, summary: BuildSummaryResult): Analyze
       filePath: null,
       evidence: null,
       codeSnippet: null,
-    }););
+    });
   }
 
   return issues;
@@ -790,6 +790,8 @@ if (hasOpenAiKey && aiInputIssues.length > 0) {
     );
   }
 }
+
+
 
 
 
