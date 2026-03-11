@@ -491,7 +491,10 @@ function detectIssues(projectRoot: string, summary: BuildSummaryResult): Analyze
         "package.json exists, but common execution scripts such as dev, start, build, or deploy were not found.",
       fix:
         "Add scripts like dev, build, or deploy to package.json so the project can be run and verified more easily.",
-    });
+      filePath: null,
+      evidence: null,
+      codeSnippet: null,
+    }););
   }
 
   const readmePath = path.join(projectRoot, "README.md");
@@ -505,7 +508,10 @@ function detectIssues(projectRoot: string, summary: BuildSummaryResult): Analyze
         "README.md was not found in the project root, so setup steps and project purpose are harder to understand.",
       fix:
         "Add a README.md with project overview, setup steps, run commands, and deployment notes.",
-    });
+      filePath: null,
+      evidence: null,
+      codeSnippet: null,
+    }););
   }
 
   const usesDiscordWebhook =
@@ -526,7 +532,10 @@ function detectIssues(projectRoot: string, summary: BuildSummaryResult): Analyze
         "The code references DISCORD_WEBHOOK_URL, but that binding was not found in the detected Wrangler config preview.",
       fix:
         "Add DISCORD_WEBHOOK_URL to Wrangler vars or secrets so the Worker can access the webhook at runtime.",
-    });
+      filePath: null,
+      evidence: null,
+      codeSnippet: null,
+    }););
   }
 
   return issues;
@@ -781,6 +790,8 @@ if (hasOpenAiKey && aiInputIssues.length > 0) {
     );
   }
 }
+
+
 
 
 
