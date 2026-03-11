@@ -1,418 +1,403 @@
-﻿import { saveRunContext } from '../../../lib/server/run-context'
-import { NextRequest, NextResponse } from 'next/server'
-import fs from 'fs'
-import path from 'path'
-import AdmZip from 'adm-zip'
-import OpenAI from 'openai'
-import { spawnSync } from 'child_process'
+﻿import { NextRequest, NextResponse } from "next/server";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import AdmZip from "adm-zip";
+import { spawnSync } from "child_process";
+import OpenAI from "openai";
 
-type RepoSummary = {
-  hasPackageJson: boolean
-  hasTsconfig: boolean
-  hasSchemaSql: boolean
-  hasSrcIndexTs: boolean
-  packageName: string
-  scriptNames: string[]
-  wranglerPath: string
-  wranglerMain: string
-  wranglerPreview: string
-  entryFile: string
-  srcIndexPreview: string
-  runtime: string
-  runtimeReason: string
-  framework: string
-  frameworkReason: string
-  platform: string
-  platformReason: string
-  database: string
-  databaseReason: string
-}
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-type AnalyzeIssue = {
-  id: string
-  severity: 'info' | 'warning' | 'error'
-  title: string
-  reason: string
-  fix: string
-  filePath: string
-  evidence: string
-  codeSnippet: string
-}
-
-type AiFixResponse = {
-  summary?: string
-  patchTarget?: string
-  patchExample?: string
-  warnings?: string[]
-}
-
-type AiFixItem = {
-  issueId: string
-  response: string
-}
-
-type ReadyToApplyItem = {
-  issueId: string
-  filePath: string
-  patchTarget: string
-  summary: string
-  patchExample: string
-  warnings: string[]
-}
-
-type ExtractInfo = {
-  has7z: boolean
-  sevenZExtracted: boolean
-  scanRoot: string
+function getAppTmpRoot(): string {
+  return path.join(os.tmpdir(), "codeade");
 }
 
 function ensureDir(dirPath: string) {
-  fs.mkdirSync(dirPath, { recursive: true })
+  fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function safeReadFile(filePath: string): string {
-  try {
-    return fs.readFileSync(filePath, 'utf8')
-  } catch {
-    return ''
-  }
+function shouldSkipDirectory(dirName: string): boolean {
+  return [
+    "node_modules",
+    ".git",
+    ".next",
+    ".wrangler",
+    "dist",
+    "build"
+  ].includes(dirName);
 }
 
-function listImmediateEntries(dirPath: string): string[] {
-  if (!fs.existsSync(dirPath)) {
-    return []
-  }
+function walkFiles(rootDir: string): string[] {
+  const results: string[] = [];
 
-  try {
-    return fs.readdirSync(dirPath, { withFileTypes: true }).map((entry) => {
-      return entry.isDirectory() ? `[dir] ${entry.name}` : `[file] ${entry.name}`
-    })
-  } catch {
-    return []
-  }
-}
-
-function listAllFiles(rootDir: string): string[] {
-  if (!fs.existsSync(rootDir)) {
-    return []
-  }
-
-  const results: string[] = []
-
-  function walk(currentPath: string) {
-    const entries = fs.readdirSync(currentPath, { withFileTypes: true })
+  function walk(currentDir: string) {
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
 
     for (const entry of entries) {
-      const fullPath = path.join(currentPath, entry.name)
+      const fullPath = path.join(currentDir, entry.name);
 
       if (entry.isDirectory()) {
-        if (
-          entry.name === 'node_modules' ||
-          entry.name === '.git' ||
-          entry.name === '.next' ||
-          entry.name === 'dist' ||
-          entry.name === 'build'
-        ) {
-          continue
+        if (shouldSkipDirectory(entry.name)) {
+          continue;
         }
-
-        walk(fullPath)
-      } else {
-        results.push(fullPath)
+        walk(fullPath);
+        continue;
       }
+
+      results.push(fullPath);
     }
   }
 
-  walk(rootDir)
-  return results
+  walk(rootDir);
+  return results;
 }
 
-function toRelativePath(rootDir: string, fullPath: string): string {
-  return path.relative(rootDir, fullPath)
+function detectProjectRoot(scanRoot: string): string {
+  const candidates: string[] = [];
+
+  function walk(dir: string) {
+    let entries: fs.Dirent[] = [];
+
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    const names = entries.map((e) => e.name);
+
+    if (
+      names.includes("package.json") ||
+      names.includes("wrangler.jsonc") ||
+      names.includes("wrangler.json") ||
+      names.includes("wrangler.toml")
+    ) {
+      candidates.push(dir);
+    }
+
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+
+      if (shouldSkipDirectory(e.name)) {
+        continue;
+      }
+
+      walk(path.join(dir, e.name));
+    }
+  }
+
+  function scoreProjectRoot(dir: string): number {
+    let score = 0;
+
+    if (fs.existsSync(path.join(dir, "package.json"))) score += 5;
+    if (fs.existsSync(path.join(dir, "tsconfig.json"))) score += 3;
+    if (fs.existsSync(path.join(dir, "schema.sql"))) score += 2;
+    if (fs.existsSync(path.join(dir, "wrangler.jsonc"))) score += 5;
+    if (fs.existsSync(path.join(dir, "wrangler.json"))) score += 4;
+    if (fs.existsSync(path.join(dir, "wrangler.toml"))) score += 3;
+    if (fs.existsSync(path.join(dir, "src", "index.ts"))) score += 6;
+    if (fs.existsSync(path.join(dir, "src", "index.tsx"))) score += 5;
+    if (fs.existsSync(path.join(dir, "src", "index.js"))) score += 4;
+    if (fs.existsSync(path.join(dir, "src", "index.jsx"))) score += 3;
+
+    return score;
+  }
+
+  walk(scanRoot);
+
+  if (candidates.length === 0) return scanRoot;
+
+  candidates.sort((a, b) => {
+    const scoreDiff = scoreProjectRoot(b) - scoreProjectRoot(a);
+    if (scoreDiff !== 0) {
+      return scoreDiff;
+    }
+
+    return a.length - b.length;
+  });
+
+  return candidates[0];
 }
 
 function isCodeFile(filePath: string): boolean {
-  const ext = path.extname(filePath).toLowerCase()
+  const fileName = path.basename(filePath).toLowerCase();
 
+  if (
+    fileName === "package-lock.json" ||
+    fileName === "yarn.lock" ||
+    fileName === "pnpm-lock.yaml"
+  ) {
+    return false;
+  }
+
+  const ext = path.extname(filePath).toLowerCase();
   return [
-    '.ts',
-    '.tsx',
-    '.js',
-    '.jsx',
-    '.json',
-    '.jsonc',
-    '.sql',
-    '.md',
-    '.toml',
-    '.yml',
-    '.yaml'
-  ].includes(ext)
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".json",
+    ".jsonc",
+    ".sql",
+    ".css",
+    ".html",
+    ".md",
+    ".yml",
+    ".yaml"
+  ].includes(ext);
 }
 
-function findFileByName(rootDir: string, fileName: string): string {
-  const allFiles = listAllFiles(rootDir)
-  const match = allFiles.find((filePath) => path.basename(filePath).toLowerCase() === fileName.toLowerCase())
-  return match ?? ''
+function readTextPreview(filePath: string, maxLength = 300): string {
+  try {
+    const text = fs.readFileSync(filePath, "utf8");
+    return text.replace(/\s+/g, " ").trim().slice(0, maxLength);
+  } catch {
+    return "";
+  }
 }
 
-function find7zExecutable(): string {
+function stripJsonComments(text: string): string {
+  return text
+    .replace(/^\uFEFF/, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "")
+    .trim();
+}
+
+function readWranglerInfo(projectRoot: string) {
+  const wranglerJsoncPath = path.join(projectRoot, "wrangler.jsonc");
+  const wranglerJsonPath = path.join(projectRoot, "wrangler.json");
+
+  const result = {
+    wranglerPath: "",
+    wranglerMain: "",
+    wranglerPreview: "",
+    rawText: "",
+    parsed: null as Record<string, unknown> | null,
+  };
+
+  const candidates = [wranglerJsoncPath, wranglerJsonPath];
+
+  for (const wranglerPath of candidates) {
+    if (!fs.existsSync(wranglerPath)) continue;
+
+    result.wranglerPath = path.relative(projectRoot, wranglerPath);
+    result.wranglerPreview = readTextPreview(wranglerPath, 500);
+
+    try {
+      const raw = fs.readFileSync(wranglerPath, "utf8");
+      result.rawText = raw;
+
+      const parsed = JSON.parse(stripJsonComments(raw)) as Record<string, unknown>;
+      result.parsed = parsed;
+
+      if (typeof parsed?.main === "string") {
+        result.wranglerMain = parsed.main;
+      }
+    } catch {
+    }
+
+    return result;
+  }
+
+  return result;
+}
+
+function findEntryFile(projectRoot: string): string {
+  const wranglerInfo = readWranglerInfo(projectRoot);
+
+  if (wranglerInfo.wranglerMain) {
+    const localResolved = path.join(projectRoot, wranglerInfo.wranglerMain);
+    if (fs.existsSync(localResolved)) {
+      return localResolved;
+    }
+
+    const parentResolved = path.join(path.dirname(projectRoot), wranglerInfo.wranglerMain);
+    if (fs.existsSync(parentResolved)) {
+      return parentResolved;
+    }
+  }
+
   const candidates = [
-    'C:\\Program Files\\7-Zip\\7z.exe',
-    'C:\\Program Files (x86)\\7-Zip\\7z.exe',
-    '7z'
-  ]
+    path.join(projectRoot, "src", "index.ts"),
+    path.join(projectRoot, "src", "index.tsx"),
+    path.join(projectRoot, "src", "index.js"),
+    path.join(projectRoot, "src", "index.jsx"),
+    path.join(projectRoot, "index.ts"),
+    path.join(projectRoot, "index.tsx"),
+    path.join(projectRoot, "index.js"),
+    path.join(projectRoot, "index.jsx"),
+    path.join(projectRoot, "worker.ts"),
+    path.join(projectRoot, "worker.js"),
+    path.join(path.dirname(projectRoot), "src", "index.ts"),
+    path.join(path.dirname(projectRoot), "src", "index.tsx"),
+    path.join(path.dirname(projectRoot), "src", "index.js"),
+    path.join(path.dirname(projectRoot), "src", "index.jsx")
+  ];
 
   for (const candidate of candidates) {
-    if (candidate === '7z') {
-      return candidate
-    }
-
     if (fs.existsSync(candidate)) {
-      return candidate
+      return candidate;
     }
   }
 
-  return '7z'
+  return "";
 }
 
-function extractArchiveWith7z(archivePath: string, outDir: string): boolean {
-  const sevenZPath = find7zExecutable()
-  ensureDir(outDir)
-
-  const result = spawnSync(sevenZPath, ['x', archivePath, `-o${outDir}`, '-y'], {
-    encoding: 'utf8',
-    shell: sevenZPath === '7z'
-  })
-
-  return result.status === 0 && listAllFiles(outDir).length > 0
-}
-
-function resolveNestedArchiveScanRoot(scanRoot: string): string {
-  let currentRoot = scanRoot
-
-  for (let depth = 0; depth < 3; depth += 1) {
-    const entries = fs.existsSync(currentRoot)
-      ? fs.readdirSync(currentRoot, { withFileTypes: true })
-      : []
-
-    if (entries.length !== 1) {
-      return currentRoot
-    }
-
-    const onlyEntry = entries[0]
-    const onlyPath = path.join(currentRoot, onlyEntry.name)
-
-    if (onlyEntry.isDirectory()) {
-      currentRoot = onlyPath
-      continue
-    }
-
-    const ext = path.extname(onlyEntry.name).toLowerCase()
-    if (ext !== '.7z' && ext !== '.zip') {
-      return currentRoot
-    }
-
-    const nestedOutDir = path.join(currentRoot, `_nested_${depth}`)
-    const ok = extractArchiveWith7z(onlyPath, nestedOutDir)
-
-    if (!ok) {
-      return currentRoot
-    }
-
-    currentRoot = nestedOutDir
+function resolveProjectRoot(projectRoot: string): string {
+  if (
+    fs.existsSync(path.join(projectRoot, "package.json")) ||
+    fs.existsSync(path.join(projectRoot, "wrangler.jsonc")) ||
+    fs.existsSync(path.join(projectRoot, "wrangler.json")) ||
+    fs.existsSync(path.join(projectRoot, "wrangler.toml"))
+  ) {
+    return projectRoot;
   }
 
-  return currentRoot
+  let entries: fs.Dirent[] = [];
+  try {
+    entries = fs.readdirSync(projectRoot, { withFileTypes: true });
+  } catch {
+    return projectRoot;
+  }
+
+  const childCandidates = entries
+    .filter((entry) => entry.isDirectory() && !shouldSkipDirectory(entry.name))
+    .map((entry) => path.join(projectRoot, entry.name))
+    .filter((childDir) => {
+      return (
+        fs.existsSync(path.join(childDir, "package.json")) ||
+        fs.existsSync(path.join(childDir, "wrangler.jsonc")) ||
+        fs.existsSync(path.join(childDir, "wrangler.json")) ||
+        fs.existsSync(path.join(childDir, "wrangler.toml"))
+      );
+    });
+
+  if (childCandidates.length === 1) {
+    return childCandidates[0];
+  }
+
+  if (childCandidates.length > 1) {
+    childCandidates.sort((a, b) => b.length - a.length);
+    return childCandidates[0];
+  }
+
+  return projectRoot;
 }
 
-function extractZipWithFallback(zipPath: string, extractRoot: string): ExtractInfo {
-  const zipExtractRoot = extractRoot
+function readPackageJson(projectRoot: string) {
+  const packageJsonPath = path.join(projectRoot, "package.json");
+
+  if (!fs.existsSync(packageJsonPath)) {
+    return null;
+  }
 
   try {
-    const zip = new AdmZip(zipPath)
-    zip.extractAllTo(zipExtractRoot, true)
+    return JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as Record<string, unknown>;
   } catch {
+    return null;
+  }
+}
+
+function hasDependency(
+  packageJson: Record<string, unknown> | null,
+  packageName: string
+): boolean {
+  if (!packageJson) return false;
+
+  const dependencies =
+    packageJson.dependencies && typeof packageJson.dependencies === "object"
+      ? (packageJson.dependencies as Record<string, unknown>)
+      : {};
+
+  const devDependencies =
+    packageJson.devDependencies && typeof packageJson.devDependencies === "object"
+      ? (packageJson.devDependencies as Record<string, unknown>)
+      : {};
+
+  return packageName in dependencies || packageName in devDependencies;
+}
+
+function detectRepoType(
+  projectRoot: string,
+  entryFilePath: string,
+  wranglerInfo: ReturnType<typeof readWranglerInfo>
+) {
+  const packageJson = readPackageJson(projectRoot);
+  const entryExt = entryFilePath ? path.extname(entryFilePath).toLowerCase() : "";
+  const entryPreview = entryFilePath ? readTextPreview(entryFilePath, 800) : "";
+  const wranglerParsed = wranglerInfo.parsed;
+
+  let runtime = "unknown";
+  let framework = "unknown";
+  let platform = "unknown";
+  let database = "unknown";
+
+  let runtimeReason = "";
+  let frameworkReason = "";
+  let platformReason = "";
+  let databaseReason = "";
+
+  if (
+    entryExt === ".ts" ||
+    entryExt === ".tsx" ||
+    fs.existsSync(path.join(projectRoot, "tsconfig.json")) ||
+    hasDependency(packageJson, "typescript")
+  ) {
+    runtime = "typescript";
+    runtimeReason = "tsconfig.json or TypeScript entry/dependency detected";
+  } else if (entryExt === ".js" || entryExt === ".jsx") {
+    runtime = "javascript";
+    runtimeReason = "JavaScript entry file detected";
   }
 
-  const initialFiles = listAllFiles(zipExtractRoot)
-  if (initialFiles.length > 1) {
-    return {
-      has7z: true,
-      sevenZExtracted: false,
-      scanRoot: resolveNestedArchiveScanRoot(zipExtractRoot)
-    }
+  const hasWrangler = Boolean(wranglerInfo.wranglerPath);
+  const looksLikeWorker =
+    hasWrangler ||
+    /export\s+default\s*\{/.test(entryPreview) ||
+    /addEventListener\s*\(\s*["']fetch["']/.test(entryPreview) ||
+    /\bfetch\s*\(\s*request\s*[:,)]/.test(entryPreview) ||
+    /\bRequest\b/.test(entryPreview) ||
+    /\bResponse\b/.test(entryPreview);
+
+  if (looksLikeWorker) {
+    framework = "worker";
+    frameworkReason = "wrangler or worker-like fetch handler detected";
   }
 
-  const sevenZExtractRoot = path.join(extractRoot, '_7z_extracted')
-  const sevenZWorked = extractArchiveWith7z(zipPath, sevenZExtractRoot)
+  if (hasWrangler) {
+    platform = "cloudflare-workers";
+    platformReason = "wrangler config detected";
+  }
 
-  if (sevenZWorked) {
-    return {
-      has7z: true,
-      sevenZExtracted: true,
-      scanRoot: resolveNestedArchiveScanRoot(sevenZExtractRoot)
-    }
+  const wranglerHasD1 =
+    Boolean(wranglerParsed) &&
+    Array.isArray((wranglerParsed as Record<string, unknown>).d1_databases);
+
+  const schemaSqlPath = path.join(projectRoot, "schema.sql");
+  const schemaPreview = fs.existsSync(schemaSqlPath)
+    ? readTextPreview(schemaSqlPath, 500)
+    : "";
+
+  const usesSqliteLikeSignals =
+    /\bCREATE\s+TABLE\b/i.test(schemaPreview) ||
+    /\bINSERT\s+INTO\b/i.test(schemaPreview) ||
+    /\bSELECT\b/i.test(schemaPreview);
+
+  if (wranglerHasD1) {
+    database = "d1/sqlite";
+    databaseReason = "d1_databases found in wrangler config";
+  } else if (usesSqliteLikeSignals) {
+    database = "sqlite";
+    databaseReason = "SQL schema signals detected";
   }
 
   return {
-    has7z: true,
-    sevenZExtracted: false,
-    scanRoot: resolveNestedArchiveScanRoot(zipExtractRoot)
-  }
-}
-
-function scoreDirectory(dirPath: string): number {
-  const packageJson = path.join(dirPath, 'package.json')
-  const tsconfig = path.join(dirPath, 'tsconfig.json')
-  const wranglerJsonc = path.join(dirPath, 'wrangler.jsonc')
-  const wranglerToml = path.join(dirPath, 'wrangler.toml')
-  const srcIndexTs = path.join(dirPath, 'src', 'index.ts')
-  const schemaSql = path.join(dirPath, 'schema.sql')
-
-  let score = 0
-
-  if (fs.existsSync(packageJson)) score += 5
-  if (fs.existsSync(tsconfig)) score += 3
-  if (fs.existsSync(wranglerJsonc) || fs.existsSync(wranglerToml)) score += 4
-  if (fs.existsSync(srcIndexTs)) score += 3
-  if (fs.existsSync(schemaSql)) score += 2
-
-  return score
-}
-
-function adjustProjectRoot(candidateRoot: string, scanRoot: string): string {
-  const candidateSrcIndex = path.join(candidateRoot, 'src', 'index.ts')
-  if (fs.existsSync(candidateSrcIndex)) {
-    return candidateRoot
-  }
-
-  const parentDir = path.dirname(candidateRoot)
-  const scanRootNormalized = path.resolve(scanRoot)
-  const parentNormalized = path.resolve(parentDir)
-
-  if (!parentNormalized.startsWith(scanRootNormalized)) {
-    return candidateRoot
-  }
-
-  const parentSrcIndex = path.join(parentDir, 'src', 'index.ts')
-  if (fs.existsSync(parentSrcIndex)) {
-    return parentDir
-  }
-
-  return candidateRoot
-}
-
-function detectProjectRoot(extractRoot: string): string {
-  const allDirs: string[] = []
-
-  function walkDirs(currentPath: string) {
-    allDirs.push(currentPath)
-
-    const entries = fs.readdirSync(currentPath, { withFileTypes: true })
-    for (const entry of entries) {
-      if (!entry.isDirectory()) {
-        continue
-      }
-
-      if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === '.next') {
-        continue
-      }
-
-      walkDirs(path.join(currentPath, entry.name))
-    }
-  }
-
-  walkDirs(extractRoot)
-
-  const scored = allDirs.map((dirPath) => {
-    return { dirPath, score: scoreDirectory(dirPath) }
-  })
-
-  scored.sort((a, b) => b.score - a.score)
-
-  if ((scored[0]?.score ?? 0) > 0) {
-    return adjustProjectRoot(scored[0].dirPath, extractRoot)
-  }
-
-  const allFiles = listAllFiles(extractRoot)
-  const firstCodeFile = allFiles.find(isCodeFile)
-  if (firstCodeFile) {
-    return path.dirname(firstCodeFile)
-  }
-
-  return extractRoot
-}
-
-function summarizeRepo(projectRoot: string): RepoSummary {
-  const packageJsonPath = findFileByName(projectRoot, 'package.json')
-  const tsconfigPath = findFileByName(projectRoot, 'tsconfig.json')
-  const schemaSqlPath = findFileByName(projectRoot, 'schema.sql')
-  const srcIndexTsPath = findFileByName(projectRoot, 'index.ts')
-  const wranglerJsoncPath = findFileByName(projectRoot, 'wrangler.jsonc')
-  const wranglerTomlPath = findFileByName(projectRoot, 'wrangler.toml')
-  const wranglerPath = wranglerJsoncPath || wranglerTomlPath
-
-  let packageName = ''
-  let scriptNames: string[] = []
-
-  if (packageJsonPath) {
-    try {
-      const packageJson = JSON.parse(safeReadFile(packageJsonPath))
-      packageName = typeof packageJson.name === 'string' ? packageJson.name : ''
-      scriptNames = packageJson.scripts ? Object.keys(packageJson.scripts) : []
-    } catch {
-      packageName = ''
-      scriptNames = []
-    }
-  }
-
-  const wranglerContent = wranglerPath ? safeReadFile(wranglerPath) : ''
-  const srcIndexContent = srcIndexTsPath ? safeReadFile(srcIndexTsPath) : ''
-
-  let runtime = 'unknown'
-  let runtimeReason = 'No clear runtime indicators found'
-
-  if (tsconfigPath || srcIndexTsPath || packageJsonPath) {
-    runtime = 'typescript'
-    runtimeReason = 'tsconfig.json or TypeScript entry/dependency detected'
-  }
-
-  let framework = 'unknown'
-  let frameworkReason = 'No clear framework indicators found'
-
-  if (wranglerPath || srcIndexContent.includes('fetch(') || srcIndexContent.includes('fetch(request')) {
-    framework = 'worker'
-    frameworkReason = 'wrangler or worker-like fetch handler detected'
-  }
-
-  let platform = 'unknown'
-  let platformReason = 'No clear platform indicators found'
-
-  if (wranglerPath) {
-    platform = 'cloudflare-workers'
-    platformReason = 'wrangler config detected'
-  }
-
-  let database = 'unknown'
-  let databaseReason = 'No clear database indicators found'
-
-  if (wranglerContent.includes('d1_databases')) {
-    database = 'd1/sqlite'
-    databaseReason = 'd1_databases found in wrangler config'
-  }
-
-  return {
-    hasPackageJson: Boolean(packageJsonPath),
-    hasTsconfig: Boolean(tsconfigPath),
-    hasSchemaSql: Boolean(schemaSqlPath),
-    hasSrcIndexTs: Boolean(srcIndexTsPath),
-    packageName,
-    scriptNames,
-    wranglerPath: wranglerPath ? path.basename(wranglerPath) : '',
-    wranglerMain: wranglerContent.match(/"main"\s*:\s*"([^"]+)"/)?.[1] ?? '',
-    wranglerPreview: wranglerContent.slice(0, 500),
-    entryFile: srcIndexTsPath ? toRelativePath(projectRoot, srcIndexTsPath) : '',
-    srcIndexPreview: srcIndexContent.slice(0, 350),
     runtime,
     runtimeReason,
     framework,
@@ -421,376 +406,417 @@ function summarizeRepo(projectRoot: string): RepoSummary {
     platformReason,
     database,
     databaseReason
-  }
+  };
 }
 
-function detectIssues(projectRoot: string, summary: RepoSummary): AnalyzeIssue[] {
-  const issues: AnalyzeIssue[] = []
+function collectDisplayFiles(projectRoot: string): string[] {
+  const files = new Set<string>();
 
-  if (summary.hasPackageJson) {
-    const usefulScripts = ['dev', 'start', 'build', 'deploy']
-    const missingScripts = usefulScripts.filter((name) => !summary.scriptNames.includes(name))
-
-    if (missingScripts.length > 0) {
-      issues.push({
-        id: 'missing-useful-npm-scripts',
-        severity: 'warning',
-        title: 'Missing useful npm scripts',
-        reason: 'package.json exists, but common execution scripts such as dev, start, build, or deploy were not found.',
-        fix: 'Add scripts like dev, build, or deploy to package.json so the project can be run and verified more easily.',
-        filePath: 'package.json',
-        evidence: 'package.json scripts do not include dev, start, build, or deploy',
-        codeSnippet: '"scripts": { "test": "..." }'
-      })
-    }
+  for (const filePath of walkFiles(projectRoot)) {
+    files.add(filePath);
   }
 
-  const readmePath = path.join(projectRoot, 'README.md')
+  const entryFilePath = findEntryFile(projectRoot);
+  if (
+    entryFilePath &&
+    fs.existsSync(entryFilePath) &&
+    entryFilePath !== projectRoot &&
+    !entryFilePath.startsWith(projectRoot + path.sep)
+  ) {
+    files.add(entryFilePath);
+  }
+
+  return Array.from(files);
+}
+
+function formatSampleFilePath(projectRoot: string, filePath: string): string {
+  if (filePath === projectRoot || filePath.startsWith(projectRoot + path.sep)) {
+    return path.relative(projectRoot, filePath);
+  }
+
+  const parentRoot = path.dirname(projectRoot);
+  return path.relative(parentRoot, filePath);
+}
+type RepoTypeSummary = {
+  runtime: string;
+  runtimeReason: string;
+  framework: string;
+  frameworkReason: string;
+  platform: string;
+  platformReason: string;
+  database: string;
+  databaseReason: string;
+};
+
+type BuildSummaryResult = {
+  hasPackageJson: boolean;
+  hasTsconfig: boolean;
+  hasSchemaSql: boolean;
+  hasSrcIndexTs: boolean;
+  packageName: string;
+  scriptNames: string[];
+  wranglerPath: string;
+  wranglerMain: string;
+  wranglerPreview: string;
+  entryFile: string;
+  srcIndexPreview: string;
+} & RepoTypeSummary;
+type AnalyzeIssue = {
+  id: string
+  severity: "critical" | "warning" | "info"
+  title: string
+  reason: string
+  fix: string
+  filePath: string | null
+  evidence: string | null
+  codeSnippet: string | null
+};
+
+function detectIssues(projectRoot: string, summary: BuildSummaryResult): AnalyzeIssue[] {
+  const issues: AnalyzeIssue[] = [];
+  const scriptNames = summary.scriptNames ?? [];
+
+  const hasUsefulScript =
+    scriptNames.includes("dev") ||
+    scriptNames.includes("start") ||
+    scriptNames.includes("build") ||
+    scriptNames.includes("deploy");
+
+  if (summary.hasPackageJson && !hasUsefulScript) {
+    issues.push({
+      id: "missing-useful-npm-scripts",
+      severity: "warning",
+      title: "Missing useful npm scripts",
+      reason:
+        "package.json exists, but common execution scripts such as dev, start, build, or deploy were not found.",
+      fix:
+        "Add scripts like dev, build, or deploy to package.json so the project can be run and verified more easily.",
+    });
+  }
+
+  const readmePath = path.join(projectRoot, "README.md");
+
   if (!fs.existsSync(readmePath)) {
     issues.push({
-      id: 'missing-readme',
-      severity: 'info',
-      title: 'Missing README',
-      reason: 'README.md was not found in the project root, so setup steps and project purpose are harder to understand.',
-      fix: 'Add a README.md with project overview, setup steps, run commands, and deployment notes.',
-      filePath: 'README.md',
-      evidence: 'README.md not found in project root',
-      codeSnippet: 'README.md file is missing in project root'
-    })
+      id: "missing-readme",
+      severity: "info",
+      title: "Missing README",
+      reason:
+        "README.md was not found in the project root, so setup steps and project purpose are harder to understand.",
+      fix:
+        "Add a README.md with project overview, setup steps, run commands, and deployment notes.",
+    });
   }
 
-  if (
-    summary.wranglerPath &&
-    summary.srcIndexPreview.includes('DISCORD_WEBHOOK_URL') &&
-    !summary.wranglerPreview.includes('DISCORD_WEBHOOK_URL')
-  ) {
+  const usesDiscordWebhook =
+    summary.srcIndexPreview.includes("DISCORD_WEBHOOK_URL") ||
+    summary.wranglerPreview.includes("DISCORD_WEBHOOK_URL");
+
+  const hasVarsSection =
+    summary.wranglerPreview.includes('"vars"') ||
+    summary.wranglerPreview.includes("'vars'") ||
+    summary.wranglerPreview.includes("DISCORD_WEBHOOK_URL");
+
+  if (usesDiscordWebhook && !hasVarsSection) {
     issues.push({
-      id: 'missing-env-binding-discord-webhook-url',
-      severity: 'warning',
-      title: 'Missing env binding for DISCORD_WEBHOOK_URL',
-      reason: 'The code references DISCORD_WEBHOOK_URL, but that binding was not found in the detected Wrangler config preview.',
-      fix: 'Add DISCORD_WEBHOOK_URL to Wrangler vars or secrets so the Worker can access the webhook at runtime.',
-      filePath: summary.wranglerPath,
-      evidence: 'DISCORD_WEBHOOK_URL referenced in srcindex.ts but not found in wrangler config',
-      codeSnippet: 'DISCORD_WEBHOOK_URL: string;'
-    })
+      id: "missing-env-binding-discord-webhook-url",
+      severity: "warning",
+      title: "Missing env binding for DISCORD_WEBHOOK_URL",
+      reason:
+        "The code references DISCORD_WEBHOOK_URL, but that binding was not found in the detected Wrangler config preview.",
+      fix:
+        "Add DISCORD_WEBHOOK_URL to Wrangler vars or secrets so the Worker can access the webhook at runtime.",
+    });
   }
 
-  return issues
+  return issues;
 }
 
-function normalizePathValue(value: string | undefined): string {
-  return (value ?? '').trim().toLowerCase().replaceAll('\\', '/')
-}
+function buildSummary(projectRoot: string): BuildSummaryResult {
+  const packageJsonPath = path.join(projectRoot, "package.json");
+  const tsconfigPath = path.join(projectRoot, "tsconfig.json");
+  const schemaSqlPath = path.join(projectRoot, "schema.sql");
+  const entryFilePath = findEntryFile(projectRoot);
+  const srcIndexTsPath = entryFilePath;
+  const wranglerInfo = readWranglerInfo(projectRoot);
+  const repoType = detectRepoType(projectRoot, entryFilePath, wranglerInfo);
 
-function pathMatchesDetectedTarget(target: string, detectedFileSet: Set<string>): boolean {
-  if (!target) {
-    return false
-  }
+  let packageName = "";
+  let scriptNames: string[] = [];
 
-  if (detectedFileSet.has(target)) {
-    return true
-  }
-
-  for (const detected of detectedFileSet) {
-    if (detected === target || detected.endsWith(`/${target}`)) {
-      return true
-    }
-  }
-
-  return false
-}
-
-function extractComparablePatchTarget(value: string | undefined, fallbackFilePath?: string): string {
-  const raw = (value ?? '').trim()
-  const fallback = normalizePathValue(fallbackFilePath)
-
-  if (!raw) {
-    return fallback
-  }
-
-  const normalizedRaw = normalizePathValue(raw)
-
-  if (
-    fallback &&
-    (normalizedRaw.includes('package.json') || normalizedRaw.includes('wrangler.jsonc') || normalizedRaw.includes('readme.md'))
-  ) {
-    return fallback
-  }
-
-  const filenameMatches = raw.match(/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+/g)
-
-  if (filenameMatches && filenameMatches.length > 0) {
-    const extracted = normalizePathValue(filenameMatches[filenameMatches.length - 1])
-
-    if (
-      fallback &&
-      (extracted.includes('package.json') || extracted.includes('wrangler.jsonc') || extracted.includes('readme.md'))
-    ) {
-      return fallback
-    }
-
-    return extracted
-  }
-
-  return fallback || normalizedRaw
-}
-
-function looksLikeNewFileSuggestion(issue: AnalyzeIssue | undefined, comparablePatchTarget: string): boolean {
-  if (!issue) {
-    return false
-  }
-
-  const title = issue.title.toLowerCase()
-  const evidence = issue.evidence.toLowerCase()
-  const codeSnippet = issue.codeSnippet.toLowerCase()
-
-  if (title.includes('missing readme') && normalizePathValue(issue.filePath) === 'readme.md') {
-    return true
-  }
-
-  if (
-    evidence.includes('readme.md not found in project root') &&
-    codeSnippet.includes('readme.md file is missing') &&
-    normalizePathValue(issue.filePath) === 'readme.md'
-  ) {
-    return true
-  }
-
-  if (comparablePatchTarget === 'readme.md') {
-    return true
-  }
-
-  return false
-}
-
-function cleanupJsonFence(raw: string): string {
-  const trimmed = raw.trim()
-
-  if (trimmed.startsWith('```')) {
-    return trimmed
-      .replace(/^```[a-zA-Z0-9_-]*\s*/, '')
-      .replace(/\s*```$/, '')
-      .trim()
-  }
-
-  return trimmed
-}
-
-function parseAiFixResponse(raw: string): AiFixResponse | null {
-  try {
-    const cleaned = cleanupJsonFence(raw)
-    const parsed = JSON.parse(cleaned)
-
-    return {
-      summary: typeof parsed.summary === 'string' ? parsed.summary : '',
-      patchTarget: typeof parsed.patchTarget === 'string' ? parsed.patchTarget : '',
-      patchExample: typeof parsed.patchExample === 'string' ? parsed.patchExample : '',
-      warnings: Array.isArray(parsed.warnings)
-        ? parsed.warnings.filter((item): item is string => typeof item === 'string')
-        : []
-    }
-  } catch {
-    return null
-  }
-}
-
-function buildReadyToApply(
-  aiFixes: AiFixItem[],
-  issues: AnalyzeIssue[],
-  detectedFiles: string[]
-): ReadyToApplyItem[] {
-  const detectedFileSet = new Set(detectedFiles.map((filePath) => normalizePathValue(filePath)))
-
-  return aiFixes.flatMap((aiFix) => {
-    const parsed = parseAiFixResponse(aiFix.response)
-    if (!parsed) {
-      return []
-    }
-
-    const issue = issues.find((item) => item.id === aiFix.issueId)
-    const normalizedFilePath = normalizePathValue(issue?.filePath)
-    const extractedPatchTarget = extractComparablePatchTarget(parsed.patchTarget, issue?.filePath)
-    const isNewFileSuggestion = looksLikeNewFileSuggestion(issue, extractedPatchTarget)
-
-    const comparablePatchTarget =
-      isNewFileSuggestion && normalizedFilePath.length > 0
-        ? normalizedFilePath
-        : extractedPatchTarget
-
-    const hasTargetMismatch =
-      normalizedFilePath.length > 0 &&
-      comparablePatchTarget.length > 0 &&
-      normalizedFilePath !== comparablePatchTarget
-
-    const patchTargetDetected =
-      comparablePatchTarget.length > 0 && pathMatchesDetectedTarget(comparablePatchTarget, detectedFileSet)
-
-    const shouldWarnMissingPatchTarget =
-      comparablePatchTarget.length > 0 &&
-      !patchTargetDetected &&
-      !isNewFileSuggestion
-
-    const isApplyCandidate = !hasTargetMismatch && !shouldWarnMissingPatchTarget
-
-    if (!isApplyCandidate) {
-      return []
-    }
-
-    return [
-      {
-        issueId: aiFix.issueId,
-        filePath: issue?.filePath ?? '',
-        patchTarget: parsed.patchTarget ?? '',
-        summary: parsed.summary ?? '',
-        patchExample: parsed.patchExample ?? '',
-        warnings: parsed.warnings ?? []
+  if (fs.existsSync(packageJsonPath)) {
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+      packageName = typeof packageJson.name === "string" ? packageJson.name : "";
+      if (packageJson.scripts && typeof packageJson.scripts === "object") {
+        scriptNames = Object.keys(packageJson.scripts);
       }
-    ]
-  })
-}
-
-async function generateAiFixes(issues: AnalyzeIssue[]): Promise<{ aiEnabled: boolean; aiFixes: AiFixItem[] }> {
-  const apiKey = process.env.OPENAI_API_KEY
-
-  if (!apiKey) {
-    return { aiEnabled: false, aiFixes: [] }
+    } catch {
+    }
   }
 
-  const client = new OpenAI({ apiKey })
-  const aiFixes: AiFixItem[] = []
-
-  for (const issue of issues) {
-    const prompt = [
-      'You are a code repair assistant.',
-      'Return only valid JSON.',
-      'Do not wrap the JSON in markdown code fences.',
-      'Use this exact shape:',
-      '{',
-      '  "summary": "string",',
-      '  "patchTarget": "string",',
-      '  "patchExample": "string",',
-      '  "warnings": ["string"]',
-      '}',
-      '',
-      `Issue ID: ${issue.id}`,
-      `Title: ${issue.title}`,
-      `Reason: ${issue.reason}`,
-      `Suggested Fix: ${issue.fix}`,
-      `File Path: ${issue.filePath}`,
-      `Evidence: ${issue.evidence}`,
-      `Code Snippet: ${issue.codeSnippet}`
-    ].join('\n')
-
-    const completion = await client.responses.create({
-      model: 'gpt-4.1-mini',
-      input: prompt
-    })
-
-    const responseText =
-      completion.output_text?.trim() ||
-      '{ "summary": "", "patchTarget": "", "patchExample": "", "warnings": [] }'
-
-    aiFixes.push({
-      issueId: issue.id,
-      response: responseText
-    })
-  }
-
-  return { aiEnabled: true, aiFixes }
+  return {
+    hasPackageJson: fs.existsSync(packageJsonPath),
+    hasTsconfig: fs.existsSync(tsconfigPath),
+    hasSchemaSql: fs.existsSync(schemaSqlPath),
+    hasSrcIndexTs: Boolean(srcIndexTsPath && fs.existsSync(srcIndexTsPath)),
+    packageName,
+    scriptNames,
+    wranglerPath: wranglerInfo.wranglerPath,
+    wranglerMain: wranglerInfo.wranglerMain,
+    wranglerPreview: wranglerInfo.wranglerPreview,
+    entryFile: wranglerInfo.wranglerMain
+      ? wranglerInfo.wranglerMain.replaceAll("/", "\\")
+      : (
+          entryFilePath
+            ? (
+                entryFilePath.startsWith(projectRoot + path.sep) || entryFilePath === projectRoot
+                  ? path.relative(projectRoot, entryFilePath)
+                  : path.relative(path.dirname(projectRoot), entryFilePath)
+              )
+            : ""
+        ),
+    srcIndexPreview: entryFilePath ? readTextPreview(entryFilePath) : "",
+    runtime: repoType.runtime,
+    runtimeReason: repoType.runtimeReason,
+    framework: repoType.framework,
+    frameworkReason: repoType.frameworkReason,
+    platform: repoType.platform,
+    platformReason: repoType.platformReason,
+    database: repoType.database,
+    databaseReason: repoType.databaseReason
+  };
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const formData = await request.formData()
-    const uploadedFile = formData.get('file')
+    const formData = await request.formData();
+    const file = formData.get("file");
 
-    if (!(uploadedFile instanceof File)) {
-
-    return NextResponse.json(
-        {
-          ok: false,
-          message: 'file is required'
-        },
+    if (!file || !(file instanceof File)) {
+      return NextResponse.json(
+        { ok: false, message: "file がありません" },
         { status: 400 }
-      )
+      );
     }
 
-    const bytes = Buffer.from(await uploadedFile.arrayBuffer())
+    const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const runsRoot = path.join(getAppTmpRoot(), "runs");
+    const workRoot = path.join(runsRoot, runId);
+    const uploadDir = path.join(workRoot, "uploads");
+    const extractDir = path.join(workRoot, "extracted");
 
-    const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    const runRoot = path.join(process.cwd(), 'tmp', 'runs', runId)
-    const zipPath = path.join(runRoot, uploadedFile.name)
-    const extractRoot = path.join(runRoot, 'extracted')
+    ensureDir(uploadDir);
+    ensureDir(extractDir);
 
-    ensureDir(runRoot)
-    ensureDir(extractRoot)
-    fs.writeFileSync(zipPath, bytes)
+    const zipPath = path.join(uploadDir, file.name);
+    const arrayBuffer = await file.arrayBuffer();
+    fs.writeFileSync(zipPath, Buffer.from(arrayBuffer));
 
-    const extractInfo = extractZipWithFallback(zipPath, extractRoot)
-    const projectRoot = detectProjectRoot(extractInfo.scanRoot)
-    const allFiles = listAllFiles(projectRoot)
-    const detectedFiles = allFiles.map((filePath) => toRelativePath(projectRoot, filePath)).filter(isCodeFile)
+    const zip = new AdmZip(zipPath);
+    zip.extractAllTo(extractDir, true);
 
-    const summary = summarizeRepo(projectRoot)
-    const issues = detectIssues(projectRoot, summary)
-    const { aiEnabled, aiFixes } = await generateAiFixes(issues)
-    const readyToApply = buildReadyToApply(aiFixes, issues, detectedFiles)
+    const extractedFiles = walkFiles(extractDir);
+    const sevenZPath = extractedFiles.find((p) => p.toLowerCase().endsWith(".7z"));
 
-    await saveRunContext({
-      projectRoot,
-      scanRoot: extractInfo.scanRoot,
-      fileName: uploadedFile.name,
-    })
+    let scanRoot = extractDir;
+    let has7z = false;
+    let sevenZExtracted = false;
 
-    const runContextPath = path.join(process.cwd(), 'tmp', 'run-context.json')
-    fs.mkdirSync(path.dirname(runContextPath), { recursive: true })
-    fs.writeFileSync(
-      runContextPath,
-      JSON.stringify(
+    if (sevenZPath) {
+      has7z = true;
+
+      const sevenZOutputDir = path.join(path.dirname(sevenZPath), "_7z_extracted");
+      ensureDir(sevenZOutputDir);
+
+      const sevenZipExe = path.join(
+        process.cwd(),
+        "node_modules",
+        "7zip-bin",
+        "win",
+        "x64",
+        "7za.exe"
+      );
+
+      const result = spawnSync(
+        sevenZipExe,
+        ["x", sevenZPath, "-y", `-o${sevenZOutputDir}`],
+        { encoding: "utf8" }
+      );
+
+      if (result.status === 0) {
+        sevenZExtracted = true;
+        scanRoot = sevenZOutputDir;
+      }
+    }
+
+    let projectRoot = detectProjectRoot(scanRoot);
+    projectRoot = resolveProjectRoot(projectRoot);
+
+    const allProjectFiles = collectDisplayFiles(projectRoot).sort((a, b) =>
+      a.localeCompare(b)
+    );
+    const codeFiles = allProjectFiles.filter(isCodeFile).sort((a, b) =>
+      a.localeCompare(b)
+    );
+    const summary = buildSummary(projectRoot);
+    const issues = detectIssues(projectRoot, summary);
+    const aiInputIssues = issues.map((issue) => ({
+      id: issue.id,
+      title: issue.title,
+      reason: issue.reason,
+      fix: issue.fix,
+      filePath: issue.filePath,
+      evidence: issue.evidence,
+      codeSnippet: issue.codeSnippet
+    }));
+
+    const hasOpenAiKey = Boolean(process.env.OPENAI_API_KEY);
+    const aiFixes = [];
+
+    
+if (hasOpenAiKey && aiInputIssues.length > 0) {
+    
+  try {
+    
+    const firstIssue = aiInputIssues[0];
+    
+    const completion = await openai.responses.create({
+    
+      model: "gpt-4o-mini",
+    
+      input: [
+    
         {
-          projectRoot,
-          scanRoot: extractInfo.scanRoot,
-          fileName: uploadedFile.name,
-          updatedAt: new Date().toISOString()
+    
+          role: "system",
+    
+          content: "You are a senior TypeScript code repair assistant. Return concise JSON only."
+    
         },
-        null,
-        2
-      ),
-      'utf8'
-    )
-    return NextResponse.json({ runId,
-      ok: true,
-      message: 'ZIP upload, extraction, scan, and summary generation completed successfully',
-      fileName: uploadedFile.name,
-      scanRoot: extractInfo.scanRoot,
-      projectRoot,
-      totalFileCount: allFiles.length,
-      codeFileCount: detectedFiles.length,
-      summary,
-      aiEnabled,
-      aiFixes,
-      issues,
-      readyToApplyCount: readyToApply.length,
-      readyToApply,
-      detectedFiles,
-      scanRootEntries: listImmediateEntries(extractInfo.scanRoot),
-      projectRootEntries: listImmediateEntries(projectRoot),
-      allFilesSample: allFiles.slice(0, 30).map((filePath) => toRelativePath(projectRoot, filePath)),
-      has7z: extractInfo.has7z,
-      sevenZExtracted: extractInfo.sevenZExtracted
-    })
-  } catch (error) {
+    
+        {
+    
+          role: "user",
+    
+          content: JSON.stringify({
+    
+            task: "Create a practical fix proposal for the issue.",
+    
+            issue: firstIssue
+    
+          })
+    
+        }
+    
+      ]
+    
+    });
 
+    
+    aiFixes.push({
+    
+      issueId: firstIssue.id,
+    
+      response: completion.output_text ?? ""
+    
+    });
+    
+  } catch (error) {
+    
+    aiFixes.push({
+    
+      issueId: aiInputIssues[0].id,
+    
+      response: error instanceof Error ? error.message : String(error)
+    
+    });
+    
+  }
+    
+}
+
+
+
+    return NextResponse.json({
+      ok: true,
+      message: "ZIP upload, extraction, scan, and summary generation completed successfully",
+      fileName: file.name,
+      scanRoot,
+      projectRoot,
+      totalFileCount: allProjectFiles.length,
+      codeFileCount: codeFiles.length,
+      summary,
+      aiEnabled: hasOpenAiKey,
+      aiFixes,
+      issues: issues.map((issue) => {
+            if (issue.id === "missing-useful-npm-scripts") {
+              return { ...issue, filePath: "package.json", evidence: "package.json scripts do not include dev, start, build, or deploy", codeSnippet: "\"scripts\": { \"test\": \"...\" }" }
+            }
+
+            if (issue.id === "missing-readme") {
+              return { ...issue, filePath: "README.md", evidence: "README.md not found in project root", codeSnippet: "README.md file is missing in project root" }
+            }
+            if (issue.id === "missing-env-binding-discord-webhook-url") {
+              return { ...issue, filePath: "wrangler.jsonc", evidence: "DISCORD_WEBHOOK_URL referenced in src\index.ts but not found in wrangler.jsonc", codeSnippet: "DISCORD_WEBHOOK_URL: string;" }
+            }
+            if (issue.id === "missing-env-binding-discord-webhook-url") {
+              return { ...issue, filePath: "wrangler.jsonc", evidence: "DISCORD_WEBHOOK_URL referenced in src\index.ts but not found in wrangler.jsonc", codeSnippet: "DISCORD_WEBHOOK_URL: string;" }
+            }
+            return { ...issue, filePath: issue.filePath ?? null, evidence: issue.evidence ?? null, codeSnippet: issue.codeSnippet ?? null }
+          }), detectedFiles: codeFiles
+        .slice(0, 20)
+        .map((p) => formatSampleFilePath(projectRoot, p)),
+      has7z,
+      sevenZExtracted
+    });
+  } catch (error) {
     return NextResponse.json(
       {
         ok: false,
-        message: error instanceof Error ? error.message : 'analyze failed'
+        message: "Analysis failed",
+        error: error instanceof Error ? error.message : String(error)
       },
       { status: 500 }
-    )
+    );
   }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
