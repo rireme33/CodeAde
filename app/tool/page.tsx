@@ -1,318 +1,503 @@
-﻿import Link from "next/link";
+﻿'use client'
 
-const steps = [
-  {
-    title: "Upload a broken repo",
-    description:
-      "Drop in a ZIP file containing a broken project. CodeAde inspects the structure, config, dependencies, and source files.",
-  },
-  {
-    title: "AI analyzes and repairs",
-    description:
-      "The engine generates fixes, applies changes, runs verification, and retries automatically until the repo is stable.",
-  },
-  {
-    title: "Download the repaired repo",
-    description:
-      "Get a cleaned and repaired ZIP back without unnecessary folders like node_modules or .wrangler.",
-  },
-];
+import { useMemo, useState } from 'react'
+import SaasToolShell from './components/SaasToolShell'
 
-const demoItems = [
-  "Fix broken AI-generated code",
-  "Resolve failed installs and config issues",
-  "Repair test and build errors",
-  "Loop until verification succeeds",
-];
+type ParsedAiResponse = {
+  summary?: string
+  patchTarget?: string
+  patchExample?: string
+  warnings?: string[]
+}
 
-const pricingPlans = [
-  {
-    name: "Free",
-    price: "$0",
-    description: "Best for trying CodeAde on broken repos.",
-    features: ["ZIP upload", "Analyze repo", "AI fix preview"],
-    cta: "Try Analyze",
-    href: "/tool",
-    highlight: false,
-  },
-  {
-    name: "Pro",
-    price: "$9/mo",
-    description: "For developers who want full automated repair.",
-    features: ["Everything in Free", "Repair broken repo", "Download fixed repo"],
-    cta: "Start Repairing",
-    href: "/tool",
-    highlight: true,
-  },
-];
+type AiFixItem = {
+  issueId?: string
+  response?: string
+}
 
-export default function HomePage() {
+type IssueItem = {
+  id?: string
+  severity?: string
+  title?: string
+  reason?: string
+  fix?: string
+  filePath?: string
+  evidence?: string
+  codeSnippet?: string
+}
+
+type DisplayFixItem = {
+  issueId: string
+  rawResponse: string
+  parsed: ParsedAiResponse | null
+  issue?: IssueItem
+  hasTargetMismatch: boolean
+  patchTargetDetected: boolean
+  shouldWarnMissingPatchTarget: boolean
+  comparablePatchTarget: string
+  isApplyCandidate: boolean
+}
+
+type AnalyzeResult = {
+  ok?: boolean
+  message?: string
+  fileName?: string
+  scanRoot?: string
+  projectRoot?: string
+  totalFileCount?: number
+  codeFileCount?: number
+  aiEnabled?: boolean
+  aiFixes?: AiFixItem[]
+  issues?: IssueItem[]
+  detectedFiles?: string[]
+  [key: string]: any
+}
+
+function parseAiResponse(raw: unknown): ParsedAiResponse | null {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(raw)
+
+    return {
+      summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+      patchTarget: typeof parsed.patchTarget === 'string' ? parsed.patchTarget : '',
+      patchExample: typeof parsed.patchExample === 'string' ? parsed.patchExample : '',
+      warnings: Array.isArray(parsed.warnings)
+        ? parsed.warnings.filter((item): item is string => typeof item === 'string')
+        : []
+    }
+  } catch {
+    return null
+  }
+}
+
+function normalizePath(value: string | undefined): string {
+  return (value ?? '').trim().toLowerCase().replaceAll('\\', '/')
+}
+
+function extractComparablePatchTarget(value: string | undefined): string {
+  const raw = (value ?? '').trim()
+  if (!raw) {
+    return ''
+  }
+
+  const filenameMatches = raw.match(/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+/g)
+
+  if (filenameMatches && filenameMatches.length > 0) {
+    return normalizePath(filenameMatches[filenameMatches.length - 1])
+  }
+
+  return normalizePath(raw)
+}
+
+function looksLikeNewFileSuggestion(issue: IssueItem | undefined, comparablePatchTarget: string): boolean {
+  if (!issue) {
+    return false
+  }
+
+  const title = (issue.title ?? '').toLowerCase()
+  const evidence = (issue.evidence ?? '').toLowerCase()
+  const codeSnippet = (issue.codeSnippet ?? '').toLowerCase()
+
+  if (title.includes('missing readme') && normalizePath(issue.filePath) === 'readme.md') {
+    return true
+  }
+
+  if (
+    evidence.includes('readme.md not found in project root') &&
+    codeSnippet.includes('readme.md file is missing') &&
+    normalizePath(issue.filePath) === 'readme.md'
+  ) {
+    return true
+  }
+
+  if (comparablePatchTarget === 'readme.md') {
+    return true
+  }
+
+  return false
+}
+
+export default function Page() {
+  const [file, setFile] = useState<File | null>(null)
+  const [result, setResult] = useState<AnalyzeResult | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [isRepairing, setIsRepairing] = useState(false)
+
+  const displayFixes = useMemo<DisplayFixItem[]>(() => {
+    if (!result || !Array.isArray(result.aiFixes)) {
+      return []
+    }
+
+    const detectedFileSet = new Set(
+      Array.isArray(result.detectedFiles)
+        ? result.detectedFiles.map((filePath) => normalizePath(filePath))
+        : []
+    )
+
+    return result.aiFixes.map((fix, index) => {
+      const issueId = fix.issueId ?? String(index)
+      const rawResponse = fix.response ?? ''
+      const parsed = parseAiResponse(rawResponse)
+      const issue = Array.isArray(result.issues)
+        ? result.issues.find((item) => item.id === fix.issueId)
+        : undefined
+
+      const normalizedFilePath = normalizePath(issue?.filePath)
+      const extractedPatchTarget = extractComparablePatchTarget(parsed?.patchTarget)
+      const isNewFileSuggestion = looksLikeNewFileSuggestion(issue, extractedPatchTarget)
+
+      const comparablePatchTarget =
+        isNewFileSuggestion && normalizedFilePath.length > 0
+          ? normalizedFilePath
+          : extractedPatchTarget
+
+      const hasTargetMismatch =
+        normalizedFilePath.length > 0 &&
+        comparablePatchTarget.length > 0 &&
+        normalizedFilePath !== comparablePatchTarget
+
+      const patchTargetDetected =
+        comparablePatchTarget.length > 0 && detectedFileSet.has(comparablePatchTarget)
+
+      const shouldWarnMissingPatchTarget =
+        comparablePatchTarget.length > 0 &&
+        !patchTargetDetected &&
+        !isNewFileSuggestion
+
+      const isApplyCandidate = !hasTargetMismatch && !shouldWarnMissingPatchTarget
+
+      return {
+        issueId,
+        rawResponse,
+        parsed,
+        issue,
+        hasTargetMismatch,
+        patchTargetDetected,
+        shouldWarnMissingPatchTarget,
+        comparablePatchTarget,
+        isApplyCandidate
+      }
+    })
+  }, [result])
+
+  const readyToApplyFixes = useMemo(
+    () => displayFixes.filter((fix) => fix.isApplyCandidate),
+    [displayFixes]
+  )
+
+  const analysisSummary = useMemo(() => {
+    if (!result) {
+      return 'Upload a ZIP and run analysis.'
+    }
+
+    return [
+      `Status: ${String(result.ok)}`,
+      result.message ? `Message: ${result.message}` : '',
+      result.fileName ? `File: ${result.fileName}` : '',
+      typeof result.totalFileCount === 'number' ? `Files: ${result.totalFileCount}` : '',
+      typeof result.codeFileCount === 'number' ? `Code files: ${result.codeFileCount}` : '',
+      `Ready-to-apply fixes: ${readyToApplyFixes.length}`
+    ]
+      .filter(Boolean)
+      .join('\n')
+  }, [result, readyToApplyFixes.length])
+
+  const verifySummary = useMemo(() => {
+    if (isRepairing) {
+      return 'Repair loop is running.'
+    }
+
+    if (!result) {
+      return 'Verification has not been run yet.'
+    }
+
+    return 'Verification UI will be connected in the next step. Current page keeps analyze + apply logic intact.'
+  }, [result, isRepairing])
+
+  async function analyze() {
+    if (!file) {
+      alert('Select a ZIP file first.')
+      return
+    }
+
+    setLoading(true)
+
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+
+      const res = await fetch('/api/analyze', {
+        method: 'POST',
+        body: formData
+      })
+
+      const data = await res.json()
+      setResult(data)
+    } catch (error) {
+      setResult({
+        ok: false,
+        message: error instanceof Error ? error.message : 'Analyze failed'
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleRepair() {
+    if (!file) {
+      alert('Select a ZIP file first.')
+      return
+    }
+
+    setIsRepairing(true)
+
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+
+      const res = await fetch('/api/repair-loop', {
+        method: 'POST',
+        body: formData
+      })
+
+      const data = await res.json()
+      setResult(data)
+    } catch (error) {
+      setResult({
+        ok: false,
+        message: error instanceof Error ? error.message : 'Repair loop failed'
+      })
+    } finally {
+      setIsRepairing(false)
+    }
+  }
+
+  async function applyFix(fix: DisplayFixItem) {
+    try {
+      const res = await fetch('/api/apply', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          issueId: fix.issueId,
+          filePath: fix.issue?.filePath ?? '',
+          patchTarget: fix.parsed?.patchTarget ?? '',
+          patchExample: fix.parsed?.patchExample ?? ''
+        })
+      })
+
+      const data = await res.json()
+      alert(JSON.stringify(data, null, 2))
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Apply failed')
+    }
+  }
+
+  const uploadSlot = (
+    <div className="space-y-4">
+      <input
+        type="file"
+        accept=".zip"
+        onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+        className="block w-full text-sm text-neutral-700"
+      />
+      <div className="text-sm text-neutral-600">
+        {file ? `Selected: ${file.name}` : 'No ZIP selected'}
+      </div>
+    </div>
+  )
+
   return (
-    <main className="min-h-screen bg-slate-950 text-white">
-      <section className="relative overflow-hidden border-b border-white/10">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(59,130,246,0.18),transparent_40%),radial-gradient(circle_at_80%_20%,rgba(168,85,247,0.16),transparent_30%)]" />
-        <div className="relative mx-auto max-w-7xl px-6 py-24 sm:py-28 lg:px-8">
-          <div className="mx-auto max-w-3xl text-center">
-            <div className="mb-6 inline-flex items-center rounded-full border border-blue-400/30 bg-blue-500/10 px-4 py-1.5 text-sm text-blue-200">
-              AI repo repair for indie developers
-            </div>
+    <div className="pb-10">
+      <SaasToolShell
+        fileName={file?.name ?? result?.fileName ?? ''}
+        aiFixCount={displayFixes.length}
+        issueCount={Array.isArray(result?.issues) ? result!.issues!.length : 0}
+        repairLogCount={readyToApplyFixes.length}
+        isAnalyzing={loading}
+        isRepairing={isRepairing}
+        canAnalyze={!!file && !isRepairing}
+        canApply={readyToApplyFixes.length > 0 && !isRepairing}
+        canVerify={false}
+        canDownload={false}
+        analysisSummary={analysisSummary}
+        verifySummary={verifySummary}
+        rawJson={result ? JSON.stringify(result, null, 2) : ''}
+        uploadSlot={uploadSlot}
+        onAnalyze={analyze}
+        onRepair={handleRepair}
+      />
 
-            <h1 className="text-4xl font-bold tracking-tight sm:text-6xl">
-              Fix broken repos automatically.
-            </h1>
-
-            <p className="mt-6 text-lg leading-8 text-slate-300 sm:text-xl">
-              Upload a broken repo. Get a working repo back.
-            </p>
-
-            <p className="mx-auto mt-6 max-w-2xl text-base leading-7 text-slate-400">
-              CodeAde helps developers recover broken AI-generated projects,
-              outdated repositories, failed installs, and broken test setups
-              with an automated repair loop.
-            </p>
-
-            <div className="mt-10 flex flex-col items-center justify-center gap-4 sm:flex-row">
-              <Link
-                href="/tool"
-                className="inline-flex min-w-[180px] items-center justify-center rounded-xl bg-blue-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-blue-500"
-              >
-                Open Tool
-              </Link>
-              <a
-                href="#pricing"
-                className="inline-flex min-w-[180px] items-center justify-center rounded-xl border border-white/15 bg-white/5 px-6 py-3 text-sm font-semibold text-white transition hover:bg-white/10"
-              >
-                View Pricing
-              </a>
-            </div>
-
-            <div className="mt-12 grid grid-cols-1 gap-4 text-left sm:grid-cols-3">
-              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
-                <div className="text-sm text-slate-400">Built for</div>
-                <div className="mt-2 font-semibold text-white">
-                  indie developers
-                </div>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
-                <div className="text-sm text-slate-400">Built for</div>
-                <div className="mt-2 font-semibold text-white">AI coders</div>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
-                <div className="text-sm text-slate-400">Built for</div>
-                <div className="mt-2 font-semibold text-white">vibe coders</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section className="mx-auto max-w-7xl px-6 py-20 lg:px-8">
-        <div className="mx-auto max-w-2xl text-center">
-          <div className="text-sm font-semibold uppercase tracking-[0.2em] text-blue-300">
-            How it works
-          </div>
-          <h2 className="mt-3 text-3xl font-bold tracking-tight sm:text-4xl">
-            From broken ZIP to repaired repo
-          </h2>
-          <p className="mt-4 text-slate-400">
-            CodeAde is designed for repos that no longer build, install, or
-            pass verification.
-          </p>
-        </div>
-
-        <div className="mt-12 grid gap-6 md:grid-cols-3">
-          {steps.map((step, index) => (
-            <div
-              key={step.title}
-              className="rounded-2xl border border-white/10 bg-slate-900/70 p-6"
-            >
-              <div className="flex h-10 w-10 items-center justify-center rounded-full bg-blue-600 text-sm font-bold text-white">
-                {index + 1}
-              </div>
-              <h3 className="mt-5 text-xl font-semibold text-white">
-                {step.title}
-              </h3>
-              <p className="mt-3 text-sm leading-6 text-slate-400">
-                {step.description}
-              </p>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="border-y border-white/10 bg-white/5">
-        <div className="mx-auto grid max-w-7xl gap-10 px-6 py-20 lg:grid-cols-2 lg:px-8">
-          <div>
-            <div className="text-sm font-semibold uppercase tracking-[0.2em] text-blue-300">
-              Demo
-            </div>
-            <h2 className="mt-3 text-3xl font-bold tracking-tight sm:text-4xl">
-              Built for real broken repo problems
+      {readyToApplyFixes.length > 0 && (
+        <div className="mx-auto mt-8 w-full max-w-7xl px-4 sm:px-6 lg:px-8">
+          <div className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-sm">
+            <h2 className="text-2xl font-semibold tracking-tight text-neutral-950">
+              Ready To Apply
             </h2>
-            <p className="mt-4 max-w-xl text-slate-400">
-              CodeAde focuses on common failure patterns that developers hit
-              after AI generation, dependency drift, config mismatch, or broken
-              testing environments.
-            </p>
 
-            <ul className="mt-8 space-y-4">
-              {demoItems.map((item) => (
-                <li
-                  key={item}
-                  className="flex items-start gap-3 rounded-xl border border-white/10 bg-slate-900/70 p-4"
+            <div className="mt-6 space-y-4">
+              {readyToApplyFixes.map((fix) => (
+                <div
+                  key={fix.issueId}
+                  className="rounded-2xl border border-neutral-200 p-5"
                 >
-                  <span className="mt-1 h-2.5 w-2.5 rounded-full bg-blue-400" />
-                  <span className="text-slate-200">{item}</span>
-                </li>
+                  <div className="text-sm text-neutral-700">
+                    <strong>Issue ID:</strong> {fix.issueId}
+                  </div>
+                  <div className="mt-2 text-sm text-neutral-700">
+                    <strong>Patch Target:</strong> {fix.parsed?.patchTarget ?? ''}
+                  </div>
+                  <div className="mt-3">
+                    <strong className="text-sm text-neutral-900">Summary</strong>
+                    <pre className="mt-2 whitespace-pre-wrap text-sm text-neutral-700">
+                      {fix.parsed?.summary ?? ''}
+                    </pre>
+                  </div>
+                  <div className="mt-4">
+                    <button
+                      onClick={() => applyFix(fix)}
+                      className="inline-flex items-center justify-center rounded-2xl bg-neutral-950 px-4 py-3 text-sm font-medium text-white"
+                    >
+                      Apply
+                    </button>
+                  </div>
+                </div>
               ))}
-            </ul>
-          </div>
-
-          <div className="rounded-3xl border border-white/10 bg-slate-900 p-6 shadow-2xl">
-            <div className="rounded-2xl border border-white/10 bg-slate-950 p-5">
-              <div className="flex items-center justify-between border-b border-white/10 pb-4">
-                <div>
-                  <div className="text-sm text-slate-400">Session</div>
-                  <div className="mt-1 font-semibold text-white">
-                    repo-audit-demo.zip
-                  </div>
-                </div>
-                <span className="rounded-full bg-emerald-500/15 px-3 py-1 text-xs font-semibold text-emerald-300">
-                  Verified
-                </span>
-              </div>
-
-              <div className="space-y-4 py-5 text-sm">
-                <div className="rounded-xl border border-white/10 bg-white/5 p-4">
-                  <div className="font-medium text-white">Analyze</div>
-                  <div className="mt-1 text-slate-400">
-                    Detected dependency issues, invalid config, and failing test
-                    setup.
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-white/10 bg-white/5 p-4">
-                  <div className="font-medium text-white">Repair Loop</div>
-                  <div className="mt-1 text-slate-400">
-                    Applied fixes, ran verification, retried until success.
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-4">
-                  <div className="font-medium text-emerald-300">
-                    Download Ready
-                  </div>
-                  <div className="mt-1 text-emerald-100/80">
-                    Repaired ZIP generated successfully.
-                  </div>
-                </div>
-              </div>
-
-              <Link
-                href="/tool"
-                className="inline-flex w-full items-center justify-center rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white transition hover:bg-blue-500"
-              >
-                Try the Tool
-              </Link>
             </div>
           </div>
         </div>
-      </section>
+      )}
 
-      <section id="pricing" className="mx-auto max-w-7xl px-6 py-20 lg:px-8">
-        <div className="mx-auto max-w-2xl text-center">
-          <div className="text-sm font-semibold uppercase tracking-[0.2em] text-blue-300">
-            Pricing
-          </div>
-          <h2 className="mt-3 text-3xl font-bold tracking-tight sm:text-4xl">
-            Start free. Upgrade when you need repair.
-          </h2>
-          <p className="mt-4 text-slate-400">
-            A simple pricing model for analyzing broken repos and unlocking full
-            automated repair.
-          </p>
-        </div>
-
-        <div className="mt-12 grid gap-6 md:grid-cols-2">
-          {pricingPlans.map((plan) => (
-            <div
-              key={plan.name}
-              className={`rounded-3xl border p-8 ${
-                plan.highlight
-                  ? "border-blue-500/40 bg-blue-500/10"
-                  : "border-white/10 bg-slate-900/70"
-              }`}
-            >
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <h3 className="text-2xl font-bold text-white">{plan.name}</h3>
-                  <p className="mt-2 text-slate-400">{plan.description}</p>
-                </div>
-                {plan.highlight && (
-                  <span className="rounded-full bg-blue-500 px-3 py-1 text-xs font-semibold text-white">
-                    Popular
-                  </span>
-                )}
-              </div>
-
-              <div className="mt-6 text-4xl font-bold text-white">
-                {plan.price}
-              </div>
-
-              <ul className="mt-6 space-y-3">
-                {plan.features.map((feature) => (
-                  <li key={feature} className="flex items-center gap-3 text-sm">
-                    <span className="h-2.5 w-2.5 rounded-full bg-blue-400" />
-                    <span className="text-slate-200">{feature}</span>
-                  </li>
-                ))}
-              </ul>
-
-              <Link
-                href={plan.href}
-                className={`mt-8 inline-flex w-full items-center justify-center rounded-xl px-5 py-3 text-sm font-semibold transition ${
-                  plan.highlight
-                    ? "bg-blue-600 text-white hover:bg-blue-500"
-                    : "border border-white/10 bg-white/5 text-white hover:bg-white/10"
-                }`}
-              >
-                {plan.cta}
-              </Link>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="mx-auto max-w-7xl px-6 pb-24 lg:px-8">
-        <div className="rounded-3xl border border-white/10 bg-gradient-to-r from-blue-600/20 via-slate-900 to-purple-600/20 p-8 sm:p-10">
-          <div className="max-w-3xl">
-            <div className="text-sm font-semibold uppercase tracking-[0.2em] text-blue-300">
-              CTA
-            </div>
-            <h2 className="mt-3 text-3xl font-bold tracking-tight sm:text-4xl">
-              Recover broken repos without manual debugging.
+      {displayFixes.length > 0 && (
+        <div className="mx-auto mt-8 w-full max-w-7xl px-4 sm:px-6 lg:px-8">
+          <div className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-sm">
+            <h2 className="text-2xl font-semibold tracking-tight text-neutral-950">
+              AI Fixes
             </h2>
-            <p className="mt-4 text-slate-300">
-              Upload a broken project, inspect the analysis, preview the AI
-              fixes, and repair the repo automatically.
-            </p>
-            <div className="mt-8 flex flex-col gap-4 sm:flex-row">
-              <Link
-                href="/tool"
-                className="inline-flex items-center justify-center rounded-xl bg-blue-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-blue-500"
-              >
-                Launch CodeAde
-              </Link>
-              <a
-                href="#pricing"
-                className="inline-flex items-center justify-center rounded-xl border border-white/15 bg-white/5 px-6 py-3 text-sm font-semibold text-white transition hover:bg-white/10"
-              >
-                See Plans
-              </a>
+
+            <div className="mt-6 space-y-4">
+              {displayFixes.map((fix) => (
+                <div
+                  key={fix.issueId}
+                  className="rounded-2xl border border-neutral-200 p-5"
+                >
+                  <div className="text-sm text-neutral-700">
+                    <strong>Issue ID:</strong> {fix.issueId}
+                  </div>
+
+                  <div className="mt-2 text-sm text-neutral-700">
+                    <strong>Apply Candidate:</strong> {fix.isApplyCandidate ? 'yes' : 'no'}
+                  </div>
+
+                  {fix.issue && (
+                    <div className="mt-4 space-y-2 text-sm text-neutral-700">
+                      <div>
+                        <strong>Severity:</strong> {fix.issue.severity ?? ''}
+                      </div>
+                      <div>
+                        <strong>Title:</strong> {fix.issue.title ?? ''}
+                      </div>
+                      <div>
+                        <strong>File Path:</strong> {fix.issue.filePath ?? ''}
+                      </div>
+
+                      <div className="mt-3">
+                        <strong>Reason</strong>
+                        <pre className="mt-1 whitespace-pre-wrap">
+                          {fix.issue.reason ?? ''}
+                        </pre>
+                      </div>
+
+                      <div className="mt-3">
+                        <strong>Detected Fix</strong>
+                        <pre className="mt-1 whitespace-pre-wrap">
+                          {fix.issue.fix ?? ''}
+                        </pre>
+                      </div>
+
+                      <div className="mt-3">
+                        <strong>Evidence</strong>
+                        <pre className="mt-1 whitespace-pre-wrap">
+                          {fix.issue.evidence ?? ''}
+                        </pre>
+                      </div>
+
+                      <div className="mt-3">
+                        <strong>Code Snippet</strong>
+                        <pre className="mt-1 whitespace-pre-wrap">
+                          {fix.issue.codeSnippet ?? ''}
+                        </pre>
+                      </div>
+                    </div>
+                  )}
+
+                  {fix.parsed ? (
+                    <div className="mt-4 space-y-3 text-sm text-neutral-700">
+                      <div>
+                        <strong>Summary</strong>
+                        <pre className="mt-1 whitespace-pre-wrap">
+                          {fix.parsed.summary || ''}
+                        </pre>
+                      </div>
+
+                      <div>
+                        <strong>Patch Target</strong>
+                        <pre className="mt-1 whitespace-pre-wrap">
+                          {fix.parsed.patchTarget || ''}
+                        </pre>
+                      </div>
+
+                      {fix.hasTargetMismatch && (
+                        <div>
+                          <strong>Target mismatch:</strong> detected filePath and AI patchTarget are different.
+                        </div>
+                      )}
+
+                      {fix.shouldWarnMissingPatchTarget && (
+                        <div>
+                          <strong>Patch target not found in detectedFiles.</strong>
+                        </div>
+                      )}
+
+                      <div>
+                        <strong>Patch Example</strong>
+                        <pre className="mt-1 whitespace-pre-wrap">
+                          {fix.parsed.patchExample || ''}
+                        </pre>
+                      </div>
+
+                      <div>
+                        <strong>Warnings</strong>
+                        {fix.parsed.warnings && fix.parsed.warnings.length > 0 ? (
+                          <ul className="mt-1 list-disc pl-5">
+                            {fix.parsed.warnings.map((warning, warningIndex) => (
+                              <li key={warningIndex}>{warning}</li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <div className="mt-1">None</div>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-4">
+                      <strong className="text-sm text-neutral-900">Raw Response</strong>
+                      <pre className="mt-1 whitespace-pre-wrap text-sm text-neutral-700">
+                        {fix.rawResponse}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           </div>
         </div>
-      </section>
-    </main>
-  );
+      )}
+    </div>
+  )
 }
